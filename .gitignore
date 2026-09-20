@@ -1,0 +1,14 @@
+venv/
+venv_new/
+__pycache__/
+*.pyc
+.vscode/
+.streamlit/cache/
+.DS_Store
+Thumbs.db
+Train/
+Test/
+data/cropped/
+data/enhanced/
+*.keras.tmp
+.idea/
