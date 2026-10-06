@@ -27,9 +27,9 @@ from sign_knowledge import SIGN_KNOWLEDGE
 from intelligent_pipeline import IntelligentPipeline
 from voice_alert import speak
 
-# Optional streamlit-webrtc import
+# streamlit-webrtc & av imports
 try:
-    from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode, RTCConfiguration
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode, RTCConfiguration
     import av
     HAS_WEBRTC = True
 except ImportError:
@@ -404,6 +404,104 @@ def run_sign_inference(image_bgr: np.ndarray):
 
 
 # --------------------------------------------------
+# WebRTC Configuration & Video Processor
+# --------------------------------------------------
+if HAS_WEBRTC:
+    RTC_CONFIGURATION = RTCConfiguration(
+        {
+            "iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]},
+                {"urls": ["stun:stun1.l.google.com:19302"]},
+                {"urls": ["stun:stun2.l.google.com:19302"]},
+            ]
+        }
+    )
+
+    class TrafficSignVideoProcessor(VideoProcessorBase):
+        def __init__(self):
+            self.pipeline = IntelligentPipeline(confidence_threshold=0.80, required_frames=3)
+            self.no_sign_count = 0
+            self.voice_on = True
+
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            img_bgr = frame.to_ndarray(format="bgr24")
+            img_h, img_w = img_bgr.shape[:2]
+
+            candidates = detect_sign_candidates(img_bgr)
+
+            if not candidates:
+                self.no_sign_count += 1
+                if self.no_sign_count >= 5:
+                    self.pipeline.reset()
+
+                annotated = img_bgr.copy()
+                cv2.putText(
+                    annotated,
+                    "Searching for traffic signs...",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 220, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            else:
+                self.no_sign_count = 0
+                cand = candidates[0]
+                x, y, w, h = cand
+                x1, y1, x2, y2 = x, y, x + w, y + h
+
+                # 10% padding (consistent with GTSRB training & image inference)
+                px = int(w * 0.10)
+                py = int(h * 0.10)
+                cx1 = max(0, x1 - px)
+                cy1 = max(0, y1 - py)
+                cx2 = min(img_w, x2 + px)
+                cy2 = min(img_h, y2 + py)
+
+                crop_bgr = img_bgr[cy1:cy2, cx1:cx2]
+                if crop_bgr.size > 0 and model is not None:
+                    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                    crop_resized = cv2.resize(crop_rgb, (64, 64))
+                    crop_norm = crop_resized.astype(np.float32) / 255.0
+                    input_t = np.expand_dims(crop_norm, axis=0)
+
+                    preds = model.predict(input_t, verbose=0)[0]
+                    pred_idx = int(np.argmax(preds))
+                    conf = float(preds[pred_idx])
+                    cid = INDEX_TO_CLASS[pred_idx]
+
+                    res = self.pipeline.process_prediction(cid, conf)
+
+                    # Speak on confirmation (background TTS thread, no Streamlit UI calls)
+                    if res["new_alert"] and res["is_important"] and self.voice_on:
+                        v_text = res.get("voice_message") or res.get("message")
+                        if v_text:
+                            try:
+                                speak(v_text)
+                            except Exception:
+                                pass
+
+                    # Visual overlay
+                    annotated = img_bgr.copy()
+                    box_col = (0, 255, 0) if res["confirmed"] else (0, 220, 255)
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), box_col, 3)
+
+                    lbl = f"{res['name']} ({conf*100:.1f}%)" if res["confirmed"] else f"Checking ({conf*100:.1f}%)"
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    (tw, th), _ = cv2.getTextSize(lbl, font, 0.65, 2)
+                    cv2.rectangle(annotated, (x1, max(0, y1 - th - 8)), (x1 + tw + 8, y1), box_col, -1)
+                    cv2.putText(annotated, lbl, (x1 + 4, max(th + 4, y1 - 4)), font, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
+                else:
+                    annotated = img_bgr.copy()
+
+            return av.VideoFrame.from_ndarray(annotated, format="bgr24")
+else:
+    RTC_CONFIGURATION = None
+    TrafficSignVideoProcessor = None
+
+
+# --------------------------------------------------
 # Sidebar (Compact & Professional)
 # --------------------------------------------------
 with st.sidebar:
@@ -543,156 +641,45 @@ elif app_mode == "📹 Live Camera":
         </p>
     </div>""", unsafe_allow_html=True)
 
-    # Controls Bar
-    c_col1, c_col2, c_col3 = st.columns([1.5, 1, 1])
-    with c_col1:
-        cam_active = st.toggle("🔴 ACTIVATE LIVE WEBCAM STREAM", key="live_webcam_switch", value=False)
-    with c_col2:
-        cam_device_id = st.selectbox("Select Webcam Device", [0, 1, 2], index=0)
-    with c_col3:
-        voice_on = st.checkbox("🔊 Voice Alerts Enabled", value=True)
-
-    st.markdown("---")
-
-    v_col, info_col = st.columns([1.6, 1.2])
-
-    with v_col:
-        video_area = st.empty()
-        status_line = st.empty()
-
-    with info_col:
-        details_area = st.empty()
-
-    if not cam_active:
-        video_area.info("Click **'ACTIVATE LIVE WEBCAM STREAM'** above to start the continuous real-time video feed.")
-        with details_area.container(border=True):
-            st.markdown('<div class="card-title" style="color: #22c55e;">🟢 SYSTEM READY</div>', unsafe_allow_html=True)
-            st.markdown("**Detection Status:** Searching for traffic sign...")
-            st.markdown("""
-            Point your webcam towards a traffic sign (e.g., STOP, Speed Limit, Yield, No Entry).
-            
-            - **Candidate Filtering:** Stage-1 OpenCV detector isolates real sign candidates and filters background clutter.
-            - **3-Frame Confirmation:** Guarantees temporal consistency before triggering voice alerts.
-            - **Non-Blocking Audio:** Audible voice alert is triggered once upon sign confirmation.
-            """)
+    if not HAS_WEBRTC:
+        st.error("⚠️ `streamlit-webrtc` or `av` is not installed in the environment.")
     else:
-        pipeline = IntelligentPipeline(confidence_threshold=0.80, required_frames=3)
-        no_sign_count = 0
-        cap = cv2.VideoCapture(cam_device_id)
+        # Controls Bar
+        c_col1, c_col2 = st.columns([2, 1])
+        with c_col1:
+            st.markdown("Click **START** below to allow browser webcam access and stream in real time.")
+        with c_col2:
+            voice_on = st.checkbox("🔊 Voice Alerts Enabled", value=True)
 
-        if not cap.isOpened():
-            st.error(f"Cannot access webcam at index {cam_device_id}. Please check device availability.")
-        else:
-            status_line.success("🟢 Camera Online — Real-time webcam processing active...")
-            try:
-                while st.session_state.get("live_webcam_switch", False):
-                    ret, frame = cap.read()
-                    if not ret:
-                        status_line.error("Error reading frame from webcam.")
-                        break
+        st.markdown("---")
 
-                    img_h, img_w = frame.shape[:2]
-                    candidates = detect_sign_candidates(frame)
-                    current_event = None
+        v_col, info_col = st.columns([1.6, 1.2])
 
-                    if not candidates:
-                        no_sign_count += 1
-                        if no_sign_count >= 5:
-                            pipeline.reset()
-                        
-                        annotated = frame.copy()
-                        cv2.putText(annotated, "Searching for traffic signs...", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2, cv2.LINE_AA)
-                    else:
-                        no_sign_count = 0
-                        cand = candidates[0]
-                        x, y, w, h = cand
-                        x1, y1, x2, y2 = x, y, x + w, y + h
+        with v_col:
+            ctx = webrtc_streamer(
+                key="traffic-sign-live-camera",
+                mode=WebRtcMode.SENDRECV,
+                rtc_configuration=RTC_CONFIGURATION,
+                video_processor_factory=TrafficSignVideoProcessor,
+                media_stream_constraints={"video": True, "audio": False},
+                async_processing=True,
+            )
 
-                        # 10% padding
-                        px = int(w * 0.10)
-                        py = int(h * 0.10)
-                        cx1 = max(0, x1 - px)
-                        cy1 = max(0, y1 - py)
-                        cx2 = min(img_w, x2 + px)
-                        cy2 = min(img_h, y2 + py)
+            if ctx.video_processor:
+                ctx.video_processor.voice_on = voice_on
 
-                        crop_bgr = frame[cy1:cy2, cx1:cx2]
-                        if crop_bgr.size > 0:
-                            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-                            crop_resized = cv2.resize(crop_rgb, (64, 64))
-                            crop_norm = crop_resized.astype(np.float32) / 255.0
-                            input_t = np.expand_dims(crop_norm, axis=0)
-
-                            preds = model.predict(input_t, verbose=0)[0]
-                            pred_idx = int(np.argmax(preds))
-                            conf = float(preds[pred_idx])
-                            cid = INDEX_TO_CLASS[pred_idx]
-
-                            res = pipeline.process_prediction(cid, conf)
-                            current_event = res
-                            current_event["class_id"] = cid
-
-                            # Speak on confirmation
-                            if res["new_alert"] and res["is_important"] and voice_on:
-                                v_text = res.get("voice_message") or res.get("message")
-                                if v_text:
-                                    trigger_voice_alert(v_text, is_live=True)
-
-                            # Visual overlay
-                            annotated = frame.copy()
-                            box_col = (0, 255, 0) if res["confirmed"] else (0, 220, 255)
-                            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_col, 3)
-
-                            lbl = f"{res['name']} ({conf*100:.1f}%)" if res["confirmed"] else f"Checking ({conf*100:.1f}%)"
-                            font = cv2.FONT_HERSHEY_SIMPLEX
-                            (tw, th), _ = cv2.getTextSize(lbl, font, 0.65, 2)
-                            cv2.rectangle(annotated, (x1, max(0, y1 - th - 8)), (x1 + tw + 8, y1), box_col, -1)
-                            cv2.putText(annotated, lbl, (x1 + 4, max(th + 4, y1 - 4)), font, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
-                        else:
-                            annotated = frame.copy()
-
-                    # Render video frame
-                    video_area.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-                    # Render live info panel
-                    if current_event and current_event["confirmed"]:
-                        with details_area.container(border=True):
-                            st.markdown('<div class="card-title" style="color: #22c55e;">🟢 SIGN CONFIRMED</div>', unsafe_allow_html=True)
-                            st.markdown(f'<div class="res-sign-title">{current_event["name"]}</div>', unsafe_allow_html=True)
-                            
-                            c_top1, c_top2 = st.columns(2)
-                            with c_top1:
-                                st.metric("Confidence", f"{current_event['confidence']*100:.1f}%")
-                            with c_top2:
-                                st.markdown(f"**Class ID:** #{current_event['class_id']}")
-                                st.markdown(f"**Category:** {current_event['category']}")
-                                st.markdown(f"**Severity:** {get_severity_badge_html(current_event['severity'])}", unsafe_allow_html=True)
-                            
-                            st.markdown("---")
-                            st.markdown('<div style="font-size: 20px; font-weight: 700; color: #38bdf8;">🛡️ Safety Guidance</div>', unsafe_allow_html=True)
-                            st.markdown(f'<div class="res-guidance-text">{current_event["message"]}</div>', unsafe_allow_html=True)
-                            
-                            if current_event.get("is_important"):
-                                st.markdown("---")
-                                st.markdown('<div style="font-size: 19px; font-weight: 700; color: #4ade80;">🔊 VOICE ALERT ACTIVE</div>', unsafe_allow_html=True)
-                                st.markdown(f'<div class="res-voice-text">"{current_event.get("voice_message") or current_event["message"]}"</div>', unsafe_allow_html=True)
-                    elif current_event and not current_event["confirmed"]:
-                        with details_area.container(border=True):
-                            st.markdown('<div class="card-title" style="color: #eab308;">🟡 ANALYZING</div>', unsafe_allow_html=True)
-                            st.markdown(f"**Checking Sign:** {current_event['name']}")
-                            st.markdown(f"**Instant Confidence:** {current_event['confidence']*100:.1f}%")
-                            st.info(f"Temporal tracking: {current_event['message']}")
-                    else:
-                        with details_area.container(border=True):
-                            st.markdown('<div class="card-title" style="color: #22c55e;">🟢 SYSTEM READY</div>', unsafe_allow_html=True)
-                            st.markdown("**Detection Status:** Searching for traffic sign...")
-                            st.caption("Stage-1 candidate filter active. Background clutter is rejected.")
-
-                    time.sleep(0.03)
-
-            finally:
-                cap.release()
-                status_line.info("Webcam stream stopped.")
+        with info_col:
+            with st.container(border=True):
+                st.markdown('<div class="card-title" style="color: #22c55e;">🟢 SYSTEM READY</div>', unsafe_allow_html=True)
+                st.markdown("**Detection Status:** Active Stream")
+                st.markdown("""
+                Point your webcam towards a traffic sign (e.g., STOP, Speed Limit, Yield, No Entry).
+                
+                - **Candidate Filtering:** Stage-1 OpenCV detector isolates real sign candidates and filters background clutter.
+                - **3-Frame Confirmation:** Guarantees temporal consistency before triggering voice alerts.
+                - **Non-Blocking Audio:** Audible voice alert is triggered once upon sign confirmation.
+                - **Visual Overlay:** Bounding boxes, predicted sign class, and confidence are rendered directly on the stream.
+                """)
 
 
 # ==================================================
