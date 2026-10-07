@@ -407,15 +407,56 @@ def run_sign_inference(image_bgr: np.ndarray):
 # WebRTC Configuration & Video Processor
 # --------------------------------------------------
 if HAS_WEBRTC:
-    RTC_CONFIGURATION = RTCConfiguration(
-        {
-            "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]},
-                {"urls": ["stun:stun1.l.google.com:19302"]},
-                {"urls": ["stun:stun2.l.google.com:19302"]},
-            ]
-        }
-    )
+    def get_rtc_configuration() -> RTCConfiguration:
+        """
+        Constructs an RTCConfiguration with Google STUN servers as fallback
+        and Metered TURN servers parsed from environment variables.
+        """
+        ice_servers = [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+            {"urls": ["stun:stun2.l.google.com:19302"]},
+        ]
+
+        turn_urls_env = os.environ.get("TURN_URLS", "").strip()
+        turn_username = os.environ.get("TURN_USERNAME", "").strip()
+        turn_credential = os.environ.get("TURN_CREDENTIAL", "").strip()
+
+        default_metered_turn_urls = [
+            "turn:global.relay.metered.ca:80",
+            "turn:global.relay.metered.ca:80?transport=tcp",
+            "turn:global.relay.metered.ca:443",
+            "turns:global.relay.metered.ca:443?transport=tcp",
+        ]
+
+        if turn_username and turn_credential:
+            if turn_urls_env:
+                if turn_urls_env.startswith("[") and turn_urls_env.endswith("]"):
+                    try:
+                        parsed = json.loads(turn_urls_env)
+                        if isinstance(parsed, list):
+                            turn_urls = [str(u).strip() for u in parsed if str(u).strip()]
+                        else:
+                            turn_urls = [u.strip() for u in turn_urls_env.split(",") if u.strip()]
+                    except Exception:
+                        turn_urls = [u.strip() for u in turn_urls_env.split(",") if u.strip()]
+                else:
+                    turn_urls = [u.strip() for u in turn_urls_env.split(",") if u.strip()]
+            else:
+                turn_urls = default_metered_turn_urls
+
+            if turn_urls:
+                ice_servers.append(
+                    {
+                        "urls": turn_urls,
+                        "username": turn_username,
+                        "credential": turn_credential,
+                    }
+                )
+
+        return RTCConfiguration({"iceServers": ice_servers})
+
+    RTC_CONFIGURATION = get_rtc_configuration()
 
     class TrafficSignVideoProcessor(VideoProcessorBase):
         def __init__(self):
